@@ -107,6 +107,12 @@ fn consume_buffered_samples(count: u64) {
     });
 }
 
+fn consume_queued_buffers(count: u64) {
+    let _ = QUEUED_BUFFERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(count))
+    });
+}
+
 #[no_mangle]
 pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
     if PLAYING
@@ -356,7 +362,7 @@ fn is_likely_aac(content_type: Option<&str>, url: &str, sniff: Option<&[u8]>) ->
     }
 
     if let Some(bytes) = sniff {
-        if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xF0) == 0xF0 {
+        if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xF6) == 0xF0 {
             return true;
         }
         if bytes.len() >= 4 && &bytes[..4] == b"ADIF" {
@@ -434,6 +440,7 @@ fn decode_and_play(
                         Ok(next) => {
                             current = next;
                             current_idx = 0;
+                            consume_queued_buffers(1);
                         }
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
                             had_underrun = true;
@@ -559,6 +566,7 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
             QUEUED_BUFFERS.fetch_add(1, Ordering::Relaxed);
             while queue_guard.len() > 256 {
                 queue_guard.pop_front();
+                consume_queued_buffers(1);
             }
         }
         Ok(())
@@ -602,6 +610,9 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
             let volume = f32::from_bits(VOLUME_BITS.load(Ordering::Relaxed));
             let mut queue_guard = queue_for_callback.lock().expect("audio queue poisoned");
             let mut pending = queue_guard.pop_front();
+            if pending.is_some() {
+                consume_queued_buffers(1);
+            }
             let mut pending_index = 0usize;
             let mut consumed = 0u64;
             let mut had_underrun = false;
@@ -611,6 +622,9 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
                 {
                     pending = queue_guard.pop_front();
                     pending_index = 0;
+                    if pending.is_some() {
+                        consume_queued_buffers(1);
+                    }
                 }
                 if let Some(frame) = pending.as_ref() {
                     *sample = frame[pending_index] * volume;
