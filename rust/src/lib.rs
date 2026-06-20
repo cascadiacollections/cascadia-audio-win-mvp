@@ -1,10 +1,11 @@
 use std::ffi::CStr;
+use std::collections::VecDeque;
 use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -22,6 +23,9 @@ use symphonia::default::{get_codecs, get_probe};
 
 static PLAYING: AtomicBool = AtomicBool::new(false);
 static VOLUME_BITS: AtomicU32 = AtomicU32::new(f32::to_bits(1.0));
+static DECODED_PACKETS: AtomicU64 = AtomicU64::new(0);
+static DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static QUEUED_BUFFERS: AtomicU64 = AtomicU64::new(0);
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -53,6 +57,10 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
         }
     };
 
+    DECODED_PACKETS.store(0, Ordering::SeqCst);
+    DECODE_ERRORS.store(0, Ordering::SeqCst);
+    QUEUED_BUFFERS.store(0, Ordering::SeqCst);
+
     std::thread::spawn(move || {
         let _ = RUNTIME.block_on(stream_and_play(url));
         PLAYING.store(false, Ordering::SeqCst);
@@ -74,6 +82,25 @@ pub extern "C" fn cascadia_audio_is_playing() -> i32 {
     } else {
         0
     }
+}
+
+#[no_mangle]
+pub extern "C" fn cascadia_audio_debug_counters(
+    decoded_packets: *mut u64,
+    decode_errors: *mut u64,
+    queued_buffers: *mut u64,
+) -> i32 {
+    if decoded_packets.is_null() || decode_errors.is_null() || queued_buffers.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        *decoded_packets = DECODED_PACKETS.load(Ordering::SeqCst);
+        *decode_errors = DECODE_ERRORS.load(Ordering::SeqCst);
+        *queued_buffers = QUEUED_BUFFERS.load(Ordering::SeqCst);
+    }
+
+    1
 }
 
 async fn stream_and_play(url: String) -> Result<()> {
@@ -125,7 +152,8 @@ fn decode_and_play(
     content_type: Option<String>,
     icy_interval: Option<usize>,
 ) -> Result<()> {
-    let source = ChannelSource::new(rx, icy_interval);
+    let prebuffer = prebuffer_stream(&rx, 64 * 1024, Duration::from_secs(3));
+    let source = ChannelSource::new(rx, icy_interval, prebuffer);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
 
     let mut hint = Hint::new();
@@ -223,10 +251,14 @@ fn decode_loop(
 
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError(_)) => {
+                DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Err(SymphoniaError::IoError(_)) => break,
             Err(error) => return Err(anyhow!("decoder error: {error}")),
         };
+        DECODED_PACKETS.fetch_add(1, Ordering::Relaxed);
 
         let input_channels = decoded.spec().channels.count();
         let mut sample_buffer =
@@ -236,6 +268,7 @@ fn decode_loop(
         if ring_tx.send(remixed).is_err() {
             break;
         }
+        QUEUED_BUFFERS.fetch_add(1, Ordering::Relaxed);
     }
 
     Ok(())
@@ -287,6 +320,7 @@ fn remix_channels(input: &[f32], input_channels: usize, output_channels: usize) 
 
 struct ChannelSource {
     rx: Mutex<Receiver<Bytes>>,
+    prebuffered_chunks: VecDeque<Bytes>,
     icy_interval: Option<usize>,
     bytes_until_meta: usize,
     current_chunk: Option<Bytes>,
@@ -294,10 +328,11 @@ struct ChannelSource {
 }
 
 impl ChannelSource {
-    fn new(rx: Receiver<Bytes>, icy_interval: Option<usize>) -> Self {
+    fn new(rx: Receiver<Bytes>, icy_interval: Option<usize>, prebuffered_chunks: VecDeque<Bytes>) -> Self {
         let bytes_until_meta = icy_interval.unwrap_or(0);
         Self {
             rx: Mutex::new(rx),
+            prebuffered_chunks,
             icy_interval,
             bytes_until_meta,
             current_chunk: None,
@@ -310,6 +345,12 @@ impl ChannelSource {
             if self.chunk_offset < chunk.len() {
                 return Ok(true);
             }
+        }
+
+        if let Some(chunk) = self.prebuffered_chunks.pop_front() {
+            self.current_chunk = Some(chunk);
+            self.chunk_offset = 0;
+            return Ok(true);
         }
 
         let recv = self
@@ -433,4 +474,26 @@ impl MediaSource for ChannelSource {
     fn byte_len(&self) -> Option<u64> {
         None
     }
+}
+
+fn prebuffer_stream(rx: &Receiver<Bytes>, target_bytes: usize, max_wait: Duration) -> VecDeque<Bytes> {
+    let mut total = 0usize;
+    let mut chunks = VecDeque::new();
+    let started = Instant::now();
+
+    while PLAYING.load(Ordering::SeqCst) && total < target_bytes && started.elapsed() < max_wait {
+        let remaining = max_wait.saturating_sub(started.elapsed());
+        let wait = remaining.min(Duration::from_millis(250));
+
+        match rx.recv_timeout(wait) {
+            Ok(chunk) => {
+                total += chunk.len();
+                chunks.push_back(chunk);
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    chunks
 }
