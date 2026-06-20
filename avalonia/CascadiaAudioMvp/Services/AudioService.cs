@@ -3,12 +3,30 @@ namespace CascadiaAudioMvp.Services;
 public sealed class AudioService
 {
     private const string TestStream = "https://kexp.streamguys1.com/kexp64.aac";
+    private readonly Func<string, int> _start;
+    private readonly Func<int> _stop;
+    private readonly Func<int> _isPlaying;
 
-    public bool IsPlaying => NativeAudio.CascadiaAudioIsPlaying() == 1;
+    public AudioService()
+        : this(
+            NativeAudio.CascadiaAudioStart,
+            NativeAudio.CascadiaAudioStop,
+            NativeAudio.CascadiaAudioIsPlaying)
+    {
+    }
+
+    internal AudioService(Func<string, int> start, Func<int> stop, Func<int> isPlaying)
+    {
+        _start = start;
+        _stop = stop;
+        _isPlaying = isPlaying;
+    }
+
+    public bool IsPlaying => _isPlaying() == 1;
 
     public bool Play(string? url = null) =>
-        NativeAudio.CascadiaAudioStart(url ?? TestStream) == 1;
+        _start(url ?? TestStream) == 1;
 
     public void Stop() =>
-        NativeAudio.CascadiaAudioStop();
+        _ = _stop();
 }
