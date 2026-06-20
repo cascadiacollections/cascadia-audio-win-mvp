@@ -1,0 +1,27 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CascadiaAudioMvp.MainWindow"
+        Title="Cascadia Audio MVP"
+        Width="420"
+        Height="240">
+  <StackPanel HorizontalAlignment="Center"
+              VerticalAlignment="Center"
+              Spacing="12">
+    <TextBlock Text="Cascadia Audio MVP"
+               FontSize="24"
+               FontWeight="SemiBold" />
+    <TextBlock x:Name="StatusText"
+               Text="Stopped"
+               FontSize="16" />
+    <StackPanel Orientation="Horizontal" Spacing="8">
+      <Button x:Name="PlayButton"
+              Content="Play"
+              Click="PlayButton_Click" />
+      <Button x:Name="StopButton"
+              Content="Stop"
+              IsEnabled="False"
+              Click="StopButton_Click" />
+    </StackPanel>
+  </StackPanel>
+</Window>
+

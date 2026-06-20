@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.1.*" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.1.*" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.1.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <NativeLib Include="$(MSBuildThisFileDirectory)..\..\rust\target\release\cascadia_audio_win_mvp.dll"
+               Condition="Exists('$(MSBuildThisFileDirectory)..\..\rust\target\release\cascadia_audio_win_mvp.dll')" />
+    <NativeLib Include="$(MSBuildThisFileDirectory)..\..\rust\target\release\libcascadia_audio_win_mvp.so"
+               Condition="Exists('$(MSBuildThisFileDirectory)..\..\rust\target\release\libcascadia_audio_win_mvp.so')" />
+    <NativeLib Include="$(MSBuildThisFileDirectory)..\..\rust\target\release\libcascadia_audio_win_mvp.dylib"
+               Condition="Exists('$(MSBuildThisFileDirectory)..\..\rust\target\release\libcascadia_audio_win_mvp.dylib')" />
+  </ItemGroup>
+
+  <Target Name="BuildRustNative" BeforeTargets="BeforeBuild">
+    <Exec Command='cargo build --release --manifest-path "$(MSBuildThisFileDirectory)..\..\rust\Cargo.toml"' />
+    <Copy SourceFiles="@(NativeLib)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="'@(NativeLib)' != ''" />
+  </Target>
+</Project>
+

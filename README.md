@@ -1,49 +1,43 @@
 # cascadia-audio-win-mvp
 
 Proof of concept: live SHOUTcast/Icecast radio stream decoded in Rust
-(Symphonia + cpal/WASAPI) and played in a WinUI 3 app via P/Invoke.
+(Symphonia + cpal backend) and played in an Avalonia desktop app via P/Invoke.
 No Media Foundation. No NAudio. No Windows.Media.Playback.
 
 ## What this proves
-- Symphonia + cpal (WASAPI backend) can decode and play a live HTTP audio
-  stream on Windows
+- Symphonia + cpal can decode and play a live HTTP audio stream with a single
+  Rust engine on Linux and Windows
 - ICY metadata stripping works without corrupting MP3/AAC frame sync
 - A flat C ABI from a Rust cdylib is consumable from C# via [LibraryImport]
-  with no COM, no WinRT, no managed wrapper libraries
+  with no COM, no managed wrapper libraries
 - tokio runtime + cpal audio callback coexist without deadlock
 
 ## Prerequisites
-- Rust stable (msvc toolchain): `rustup default stable-msvc`
-- Visual Studio 2022 with "Desktop development with C++" workload (for MSVC
-  linker) and "Windows application development" workload (for WinUI 3)
-- Windows App SDK 1.5+
+- Rust stable
 - .NET 9 SDK
+- Linux audio build deps (Fedora): `sudo dnf install pkgconf-pkg-config alsa-lib-devel`
 
-## Build
+## Build (Linux)
+```bash
+cd rust
+cargo build --release
+
+cd ../avalonia/CascadiaAudioMvp
+dotnet build -c Release
+dotnet run -c Release
+```
+
+MSBuild in the Avalonia project runs the Rust build automatically before app
+build and copies the native library into the app output folder.
+
+## Build (Windows)
 ```powershell
-# Rust DLL
 cd rust
 cargo build --release --target x86_64-pc-windows-msvc
 
-# Copy DLL (or let MSBuild do it)
-copy target\x86_64-pc-windows-msvc\release\cascadia_audio_win_mvp.dll `
-     ..\windows\CascadiaAudioMvp\native\
-
-# WinUI app
-cd ..\windows
+cd ..\avalonia\CascadiaAudioMvp
 dotnet build -c Release
-# or open CascadiaAudioMvp.sln in Visual Studio and F5
-```
-
-MSBuild runs the cargo build and DLL copy automatically on BeforeBuild.
-
-## Linux (Rust crate only)
-The WinUI host is Windows-only, but the Rust crate can compile on Linux.
-
-```bash
-sudo dnf install pkgconf-pkg-config alsa-lib-devel
-cd rust
-cargo build --release
+dotnet run -c Release
 ```
 
 ## Known failure mode to watch for
@@ -61,7 +55,8 @@ pre-buffer 64KB in ChannelSource before returning the first Read bytes.
 
 ## Relationship to cascadia-audio-mvp (Android)
 The ChannelSource ICY stripping code and Symphonia pipeline are identical.
-The only platform delta is OboeSink (Android) vs cpal WASAPI (Windows).
+The only platform delta is OboeSink (Android) vs cpal host backend
+(WASAPI/ALSA/Pulse/PipeWire depending on platform).
 Both MVPs validate the same core engine. If both play audio, the
 platform-agnostic core is ready to extract into the cascadia-audio crate.
 
