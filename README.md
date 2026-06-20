@@ -1,8 +1,8 @@
 # cascadia-audio-win-mvp
 
 Proof of concept: live SHOUTcast/Icecast radio stream decoded in Rust
-(Symphonia + cpal backend) and played in an Avalonia desktop app via P/Invoke.
-No Media Foundation. No NAudio. No Windows.Media.Playback.
+(cpal backend + FFmpeg for AAC/HE-AAC) and played in an Avalonia desktop app
+via P/Invoke. No Media Foundation. No NAudio. No Windows.Media.Playback.
 
 ## What this proves
 - Symphonia + cpal can decode and play a live HTTP audio stream with a single
@@ -15,7 +15,8 @@ No Media Foundation. No NAudio. No Windows.Media.Playback.
 ## Prerequisites
 - Rust stable
 - .NET 9 SDK
-- Linux audio build deps (Fedora): `sudo dnf install pkgconf-pkg-config alsa-lib-devel`
+- FFmpeg CLI installed and on `PATH` (required for AAC/HE-AAC decoding)
+- Linux audio build deps (Fedora): `sudo dnf install pkgconf-pkg-config alsa-lib-devel ffmpeg`
 
 ## Build (Linux)
 ```bash
@@ -41,9 +42,10 @@ dotnet run -c Release
 ```
 
 ## Known failure mode to watch for
-Symphonia needs enough buffered bytes to probe the stream format before
-decoding begins. If you get a probe failure on first run, the fix is to
-pre-buffer 64KB in ChannelSource before returning the first Read bytes.
+The AAC path now uses FFmpeg so it can handle HE-AAC and ADTS framing, but
+stream startup still benefits from pre-buffering. If playback stalls on first
+launch, wait a moment for the initial audio buffer to accumulate before judging
+it a failure.
 
 ## Known limitations (deferred to full engine)
 - No pause, only stop

@@ -1,17 +1,21 @@
-use std::ffi::CStr;
 use std::collections::VecDeque;
-use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
+use std::ffi::CStr;
+use std::io::{BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
 use std::os::raw::c_char;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    BufferSize,
+};
 use futures::StreamExt;
-use reqwest::header::{CONTENT_TYPE, HeaderValue};
+use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -108,7 +112,10 @@ async fn stream_and_play(url: String) -> Result<()> {
     let response = client
         .get(&url)
         .header("Icy-MetaData", HeaderValue::from_static("1"))
-        .header("User-Agent", HeaderValue::from_static("cascadia-audio-win-mvp/0.1"))
+        .header(
+            "User-Agent",
+            HeaderValue::from_static("cascadia-audio-win-mvp/0.1"),
+        )
         .send()
         .await
         .with_context(|| format!("request failed for stream URL: {url}"))?
@@ -125,6 +132,14 @@ async fn stream_and_play(url: String) -> Result<()> {
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
+
+    if content_type
+        .as_deref()
+        .map(|ct| ct.contains("aac"))
+        .unwrap_or(false)
+    {
+        return decode_aac_ffmpeg(&url);
+    }
 
     let (tx, rx) = mpsc::sync_channel::<Bytes>(32);
     let mut stream = response.bytes_stream();
@@ -154,6 +169,7 @@ fn decode_and_play(
 ) -> Result<()> {
     let prebuffer = prebuffer_stream(&rx, 64 * 1024, Duration::from_secs(3));
     let source = ChannelSource::new(rx, icy_interval, prebuffer);
+
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
 
     let mut hint = Hint::new();
@@ -226,7 +242,179 @@ fn decode_and_play(
     )?;
     stream.play()?;
 
-    decode_loop(&mut *format, &mut *decoder, ring_tx, track_id, output_channels)?;
+    decode_loop(
+        &mut *format,
+        &mut *decoder,
+        ring_tx,
+        track_id,
+        output_channels,
+    )?;
+    std::thread::sleep(Duration::from_millis(10));
+    Ok(())
+}
+
+fn decode_aac_ffmpeg(url: &str) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow!("no default output device"))?;
+    let config = select_output_config(&device)?;
+    let output_channels = usize::from(config.channels);
+    let output_sample_rate = config.sample_rate.0;
+
+    let queue: Arc<Mutex<VecDeque<Vec<f32>>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let queue_for_callback = Arc::clone(&queue);
+    let prebuffer_samples = (output_sample_rate as usize * output_channels) * 4;
+    let prebuffer_frames = 96usize;
+
+    let mut ffmpeg = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-reconnect")
+        .arg("1")
+        .arg("-reconnect_streamed")
+        .arg("1")
+        .arg("-reconnect_delay_max")
+        .arg("5")
+        .arg("-thread_queue_size")
+        .arg("32")
+        .arg("-fflags")
+        .arg("nobuffer")
+        .arg("-flags")
+        .arg("low_delay")
+        .arg("-i")
+        .arg(url)
+        .arg("-vn")
+        .arg("-f")
+        .arg("f32le")
+        .arg("-ar")
+        .arg(output_sample_rate.to_string())
+        .arg("-ac")
+        .arg(output_channels.to_string())
+        .arg("pipe:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start ffmpeg; install ffmpeg to decode AAC/HE-AAC streams")?;
+
+    let child_stdout = ffmpeg
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg stdout unavailable"))?;
+    let child_stderr = ffmpeg
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg stderr unavailable"))?;
+    let child_stdout = BufReader::new(child_stdout);
+    let child_stderr = BufReader::new(child_stderr);
+
+    let stdout_queue = Arc::clone(&queue);
+    let stdout_thread = std::thread::spawn(move || -> Result<()> {
+        let mut child_stdout = child_stdout;
+        let mut buffer = [0u8; 65536];
+        while PLAYING.load(Ordering::SeqCst) {
+            let n = match child_stdout.read(&mut buffer) {
+                Ok(n) => n,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+
+            let mut samples = Vec::with_capacity(n / 4);
+            let mut offset = 0usize;
+            while offset + 4 <= n {
+                let bytes = &buffer[offset..offset + 4];
+                samples.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                offset += 4;
+            }
+            if samples.is_empty() {
+                continue;
+            }
+
+            let mut queue_guard = stdout_queue.lock().expect("audio queue poisoned");
+            queue_guard.push_back(samples);
+            while queue_guard.len() > 256 {
+                queue_guard.pop_front();
+            }
+        }
+        Ok(())
+    });
+
+    let stderr_thread = std::thread::spawn(move || -> Result<()> {
+        let mut child_stderr = child_stderr;
+        let mut buffer = [0u8; 2048];
+        while let Ok(n) = child_stderr.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    while PLAYING.load(Ordering::SeqCst) {
+        if let Some(status) = ffmpeg.try_wait()? {
+            PLAYING.store(false, Ordering::SeqCst);
+            return Err(anyhow!("ffmpeg exited unexpectedly: {status}"));
+        }
+
+        let queue_guard = queue_for_callback.lock().expect("audio queue poisoned");
+        let buffered_samples = queue_guard.iter().map(|frame| frame.len()).sum::<usize>();
+        let ready = buffered_samples >= prebuffer_samples || queue_guard.len() >= prebuffer_frames;
+        drop(queue_guard);
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let stream = device.build_output_stream(
+        &config,
+        move |output: &mut [f32], _| {
+            if !PLAYING.load(Ordering::SeqCst) {
+                output.fill(0.0);
+                return;
+            }
+
+            let volume = f32::from_bits(VOLUME_BITS.load(Ordering::Relaxed));
+            let mut queue_guard = queue_for_callback.lock().expect("audio queue poisoned");
+            let mut pending = queue_guard.pop_front();
+            let mut pending_index = 0usize;
+            for sample in output.iter_mut() {
+                if pending.is_none()
+                    || pending_index >= pending.as_ref().map(|frame| frame.len()).unwrap_or(0)
+                {
+                    pending = queue_guard.pop_front();
+                    pending_index = 0;
+                }
+                if let Some(frame) = pending.as_ref() {
+                    *sample = frame[pending_index] * volume;
+                } else {
+                    *sample = 0.0;
+                }
+                pending_index += 1;
+            }
+        },
+        move |_err| {},
+        None,
+    )?;
+    stream.play()?;
+
+    while PLAYING.load(Ordering::SeqCst) {
+        if ffmpeg.try_wait()?.is_some() {
+            PLAYING.store(false, Ordering::SeqCst);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = ffmpeg.kill();
+    let _ = ffmpeg.wait();
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
 }
@@ -277,12 +465,16 @@ fn decode_loop(
 fn select_output_config(device: &cpal::Device) -> Result<cpal::StreamConfig> {
     let default_config = device.default_output_config()?;
     if default_config.sample_format() == cpal::SampleFormat::F32 {
-        return Ok(default_config.config());
+        let mut config = default_config.config();
+        config.buffer_size = BufferSize::Fixed(8192);
+        return Ok(config);
     }
 
     let mut supported = device.supported_output_configs()?;
     if let Some(config) = supported.find(|cfg| cfg.sample_format() == cpal::SampleFormat::F32) {
-        return Ok(config.with_max_sample_rate().config());
+        let mut config = config.with_max_sample_rate().config();
+        config.buffer_size = BufferSize::Fixed(8192);
+        return Ok(config);
     }
 
     Err(anyhow!("no f32 output stream config available"))
@@ -328,7 +520,11 @@ struct ChannelSource {
 }
 
 impl ChannelSource {
-    fn new(rx: Receiver<Bytes>, icy_interval: Option<usize>, prebuffered_chunks: VecDeque<Bytes>) -> Self {
+    fn new(
+        rx: Receiver<Bytes>,
+        icy_interval: Option<usize>,
+        prebuffered_chunks: VecDeque<Bytes>,
+    ) -> Self {
         let bytes_until_meta = icy_interval.unwrap_or(0);
         Self {
             rx: Mutex::new(rx),
@@ -476,7 +672,11 @@ impl MediaSource for ChannelSource {
     }
 }
 
-fn prebuffer_stream(rx: &Receiver<Bytes>, target_bytes: usize, max_wait: Duration) -> VecDeque<Bytes> {
+fn prebuffer_stream(
+    rx: &Receiver<Bytes>,
+    target_bytes: usize,
+    max_wait: Duration,
+) -> VecDeque<Bytes> {
     let mut total = 0usize;
     let mut chunks = VecDeque::new();
     let started = Instant::now();
