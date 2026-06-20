@@ -17,7 +17,7 @@ No Media Foundation. No NAudio. No Windows.Media.Playback.
 - Visual Studio 2022 with "Desktop development with C++" workload (for MSVC
   linker) and "Windows application development" workload (for WinUI 3)
 - Windows App SDK 1.5+
-- .NET 8 SDK
+- .NET 9 SDK
 
 ## Build
 ```powershell
