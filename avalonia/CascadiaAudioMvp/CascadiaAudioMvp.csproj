@@ -22,7 +22,7 @@
                Condition="Exists('$(MSBuildThisFileDirectory)..\..\rust\target\release\libcascadia_audio_win_mvp.dylib')" />
   </ItemGroup>
 
-  <Target Name="BuildRustNative" BeforeTargets="BeforeBuild">
+  <Target Name="BuildRustNative" BeforeTargets="BeforeBuild" Condition="'$(SkipRustNativeBuild)' != 'true'">
     <Exec Command='cargo build --release --manifest-path "$(MSBuildThisFileDirectory)..\..\rust\Cargo.toml"' />
     <Copy SourceFiles="@(NativeLib)"
           DestinationFolder="$(OutDir)"
@@ -30,4 +30,3 @@
           Condition="'@(NativeLib)' != ''" />
   </Target>
 </Project>
-

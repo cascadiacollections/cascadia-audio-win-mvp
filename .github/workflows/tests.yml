@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux audio deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config ffmpeg
+      - name: Run Rust tests
+        run: cargo test
+
+  dotnet-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Run Avalonia host tests
+        run: dotnet test avalonia/CascadiaAudioMvp.Tests/CascadiaAudioMvp.Tests.csproj -c Release

@@ -949,7 +949,7 @@ fn prebuffer_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::is_likely_aac;
+    use super::*;
 
     #[test]
     fn detects_aac_from_content_type() {
@@ -985,5 +985,55 @@ mod tests {
             "https://example.com/live.mp3",
             Some(&[0x49, 0x44, 0x33, 0x04])
         ));
+    }
+
+    #[test]
+    fn remix_channels_handles_common_layouts() {
+        assert_eq!(
+            remix_channels(&[0.5, -0.25], 1, 2),
+            vec![0.5, 0.5, -0.25, -0.25]
+        );
+        assert_eq!(
+            remix_channels(&[0.8, -0.2, 0.1, 0.3], 2, 1),
+            vec![0.3, 0.2]
+        );
+        assert_eq!(
+            remix_channels(&[1.0, 0.5, 0.25], 3, 2),
+            vec![1.0, 0.5]
+        );
+        assert!(remix_channels(&[1.0, 2.0], 0, 2).is_empty());
+    }
+
+    #[test]
+    fn channel_source_strips_icy_metadata() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(Bytes::from_static(b"ABCD")).expect("send audio");
+        tx.send(Bytes::from_static(b"\x01"))
+            .expect("send metadata length");
+        tx.send(Bytes::from(vec![b'x'; 16]))
+            .expect("send metadata payload");
+        tx.send(Bytes::from_static(b"EFGH")).expect("send tail audio");
+        drop(tx);
+
+        let mut source = ChannelSource::new(rx, Some(4), VecDeque::new());
+        let mut output = Vec::new();
+        source.read_to_end(&mut output).expect("read stream");
+        assert_eq!(output, b"ABCDEFGH");
+    }
+
+    #[test]
+    fn prebuffer_stream_collects_until_target() {
+        let was_playing = PLAYING.swap(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::sync_channel(4);
+        tx.send(Bytes::from_static(b"abc")).expect("send first");
+        tx.send(Bytes::from_static(b"def")).expect("send second");
+        drop(tx);
+
+        let chunks = prebuffer_stream(&rx, 5, Duration::from_millis(100));
+        PLAYING.store(was_playing, Ordering::SeqCst);
+
+        assert_eq!(chunks.len(), 2);
+        let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        assert!(total >= 5);
     }
 }

@@ -17,6 +17,7 @@ via P/Invoke. No Media Foundation. No NAudio. No Windows.Media.Playback.
 - .NET 9 SDK
 - FFmpeg CLI installed and on `PATH` (required for AAC/HE-AAC decoding)
 - Linux audio build deps (Fedora): `sudo dnf install pkgconf-pkg-config alsa-lib-devel ffmpeg`
+- Linux audio build deps (Ubuntu): `sudo apt-get install -y pkg-config libasound2-dev ffmpeg`
 
 ## Build (Linux)
 ```bash
@@ -40,6 +41,26 @@ cd ..\avalonia\CascadiaAudioMvp
 dotnet build -c Release
 dotnet run -c Release
 ```
+
+## Test workflow (local + CI)
+Run Rust unit and integration smoke tests:
+```bash
+cd rust
+cargo test
+```
+
+Run Avalonia host/service tests:
+```bash
+dotnet test avalonia/CascadiaAudioMvp.Tests/CascadiaAudioMvp.Tests.csproj -c Release
+```
+
+CI executes the same commands in `.github/workflows/tests.yml`.
+
+## Initial coverage targets
+- Rust: cover helper and stream-buffering logic (`remix_channels`,
+  `ChannelSource`, `prebuffer_stream`) plus C ABI smoke checks.
+- .NET: cover managed host service interactions (`AudioService`) without UI
+  automation.
 
 ## Known failure mode to watch for
 The AAC path now uses FFmpeg so it can handle HE-AAC and ADTS framing, but
