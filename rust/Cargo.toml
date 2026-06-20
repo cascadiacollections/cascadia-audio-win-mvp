@@ -9,9 +9,9 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 bytes = "1"
-cpal = { version = "0.15", features = ["wasm-bindgen"] }
+cpal = "0.15"
 futures = "0.3"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
@@ -19,4 +19,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 opt-level = 3
 lto = true
 strip = true
-

@@ -37,6 +37,15 @@ dotnet build -c Release
 
 MSBuild runs the cargo build and DLL copy automatically on BeforeBuild.
 
+## Linux (Rust crate only)
+The WinUI host is Windows-only, but the Rust crate can compile on Linux.
+
+```bash
+sudo dnf install pkgconf-pkg-config alsa-lib-devel
+cd rust
+cargo build --release
+```
+
 ## Known failure mode to watch for
 Symphonia needs enough buffered bytes to probe the stream format before
 decoding begins. If you get a probe failure on first run, the fix is to
@@ -61,4 +70,3 @@ If audio plays on both Android and Windows: extract shared core into
 `cascadiacollections/cascadia-audio` workspace crate, add AudioHandle
 state machine, wire UniFFI for Kotlin/Swift and P/Invoke C ABI as
 separate crate features.
-
