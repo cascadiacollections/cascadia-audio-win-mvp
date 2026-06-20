@@ -1,0 +1,22 @@
+[package]
+name = "cascadia-audio-win-mvp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+cpal = { version = "0.15", features = ["wasm-bindgen"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["stream"] }
+symphonia = { version = "0.5", features = ["mp3", "aac", "ogg"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+

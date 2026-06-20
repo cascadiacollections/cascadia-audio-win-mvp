@@ -1,0 +1,12 @@
+target/
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+AppPackages/
+BundleArtifacts/
+_pkginfo.txt
+windows/CascadiaAudioMvp/native/*.dll
+.DS_Store
+
