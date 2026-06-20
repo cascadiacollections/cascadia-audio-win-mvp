@@ -150,12 +150,8 @@ fn decode_and_play(
     let track = format
         .default_track()
         .ok_or_else(|| anyhow!("no default audio track found"))?;
+    let track_id = track.id;
     let codec_params = &track.codec_params;
-    let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
-    let channel_count = codec_params
-        .channels
-        .map(|channels| channels.count() as u16)
-        .unwrap_or(2);
 
     let mut decoder = get_codecs().make(codec_params, &DecoderOptions::default())?;
     let (ring_tx, ring_rx) = mpsc::sync_channel::<Vec<f32>>(64);
@@ -164,9 +160,8 @@ fn decode_and_play(
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow!("no default output device"))?;
-    let mut config = device.default_output_config()?.config();
-    config.sample_rate = cpal::SampleRate(sample_rate);
-    config.channels = channel_count;
+    let config = select_output_config(&device)?;
+    let output_channels = usize::from(config.channels);
 
     let mut current = Vec::<f32>::new();
     let mut current_idx = 0usize;
@@ -203,7 +198,7 @@ fn decode_and_play(
     )?;
     stream.play()?;
 
-    decode_loop(&mut *format, &mut *decoder, ring_tx)?;
+    decode_loop(&mut *format, &mut *decoder, ring_tx, track_id, output_channels)?;
     std::thread::sleep(Duration::from_millis(10));
     Ok(())
 }
@@ -212,6 +207,8 @@ fn decode_loop(
     format: &mut dyn symphonia::core::formats::FormatReader,
     decoder: &mut dyn symphonia::core::codecs::Decoder,
     ring_tx: SyncSender<Vec<f32>>,
+    track_id: u32,
+    output_channels: usize,
 ) -> Result<()> {
     while PLAYING.load(Ordering::SeqCst) {
         let packet = match format.next_packet() {
@@ -220,6 +217,10 @@ fn decode_loop(
             Err(error) => return Err(anyhow!("format read error: {error}")),
         };
 
+        if packet.track_id() != track_id {
+            continue;
+        }
+
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -227,15 +228,61 @@ fn decode_loop(
             Err(error) => return Err(anyhow!("decoder error: {error}")),
         };
 
+        let input_channels = decoded.spec().channels.count();
         let mut sample_buffer =
             SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         sample_buffer.copy_interleaved_ref(decoded);
-        if ring_tx.send(sample_buffer.samples().to_vec()).is_err() {
+        let remixed = remix_channels(sample_buffer.samples(), input_channels, output_channels);
+        if ring_tx.send(remixed).is_err() {
             break;
         }
     }
 
     Ok(())
+}
+
+fn select_output_config(device: &cpal::Device) -> Result<cpal::StreamConfig> {
+    let default_config = device.default_output_config()?;
+    if default_config.sample_format() == cpal::SampleFormat::F32 {
+        return Ok(default_config.config());
+    }
+
+    let mut supported = device.supported_output_configs()?;
+    if let Some(config) = supported.find(|cfg| cfg.sample_format() == cpal::SampleFormat::F32) {
+        return Ok(config.with_max_sample_rate().config());
+    }
+
+    Err(anyhow!("no f32 output stream config available"))
+}
+
+fn remix_channels(input: &[f32], input_channels: usize, output_channels: usize) -> Vec<f32> {
+    if input_channels == 0 || output_channels == 0 {
+        return Vec::new();
+    }
+
+    if input_channels == output_channels {
+        return input.to_vec();
+    }
+
+    let mut remixed = Vec::with_capacity((input.len() / input_channels) * output_channels);
+    for frame in input.chunks_exact(input_channels) {
+        match (input_channels, output_channels) {
+            (1, 2) => {
+                remixed.push(frame[0]);
+                remixed.push(frame[0]);
+            }
+            (2, 1) => {
+                remixed.push((frame[0] + frame[1]) * 0.5);
+            }
+            _ => {
+                for channel in 0..output_channels {
+                    remixed.push(*frame.get(channel).unwrap_or(&0.0));
+                }
+            }
+        }
+    }
+
+    remixed
 }
 
 struct ChannelSource {
@@ -387,4 +434,3 @@ impl MediaSource for ChannelSource {
         None
     }
 }
-

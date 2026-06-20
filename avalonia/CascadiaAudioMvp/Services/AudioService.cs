@@ -2,7 +2,7 @@ namespace CascadiaAudioMvp.Services;
 
 public sealed class AudioService
 {
-    private const string TestStream = "http://fm939.wnyc.org/wnycfm-app.aac";
+    private const string TestStream = "https://kexp.streamguys1.com/kexp64.aac";
 
     public bool IsPlaying => NativeAudio.CascadiaAudioIsPlaying() == 1;
 
@@ -12,4 +12,3 @@ public sealed class AudioService
     public void Stop() =>
         NativeAudio.CascadiaAudioStop();
 }
-
