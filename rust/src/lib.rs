@@ -30,6 +30,11 @@ static VOLUME_BITS: AtomicU32 = AtomicU32::new(f32::to_bits(1.0));
 static DECODED_PACKETS: AtomicU64 = AtomicU64::new(0);
 static DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static QUEUED_BUFFERS: AtomicU64 = AtomicU64::new(0);
+static UNDERRUNS: AtomicU64 = AtomicU64::new(0);
+static LATENCY_MS: AtomicU64 = AtomicU64::new(0);
+static RECONNECTS: AtomicU64 = AtomicU64::new(0);
+static PLAYBACK_STATE: AtomicU32 = AtomicU32::new(PlaybackState::Stopped as u32);
+static LAST_ERROR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -37,6 +42,70 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .build()
         .expect("failed to create tokio runtime")
 });
+
+#[repr(u32)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum PlaybackState {
+    Stopped = 0,
+    Starting = 1,
+    Buffering = 2,
+    Playing = 3,
+    Reconnecting = 4,
+    Stopping = 5,
+    Error = 6,
+}
+
+fn set_state(state: PlaybackState) {
+    PLAYBACK_STATE.store(state as u32, Ordering::SeqCst);
+}
+
+fn state() -> PlaybackState {
+    match PLAYBACK_STATE.load(Ordering::SeqCst) {
+        1 => PlaybackState::Starting,
+        2 => PlaybackState::Buffering,
+        3 => PlaybackState::Playing,
+        4 => PlaybackState::Reconnecting,
+        5 => PlaybackState::Stopping,
+        6 => PlaybackState::Error,
+        _ => PlaybackState::Stopped,
+    }
+}
+
+fn set_error(message: &str) {
+    if let Ok(mut lock) = LAST_ERROR.lock() {
+        lock.clear();
+        lock.push_str(message);
+    }
+    set_state(PlaybackState::Error);
+}
+
+fn clear_error() {
+    if let Ok(mut lock) = LAST_ERROR.lock() {
+        lock.clear();
+    }
+}
+
+fn update_latency(sample_rate: u32, channels: usize) {
+    let buffered_samples = BUFFERED_SAMPLES.load(Ordering::Relaxed);
+    if sample_rate == 0 || channels == 0 {
+        LATENCY_MS.store(0, Ordering::Relaxed);
+        return;
+    }
+    let samples_per_ms = (u64::from(sample_rate) * channels as u64).max(1) / 1000;
+    if samples_per_ms == 0 {
+        LATENCY_MS.store(0, Ordering::Relaxed);
+    } else {
+        LATENCY_MS.store(buffered_samples / samples_per_ms, Ordering::Relaxed);
+    }
+}
+
+static BUFFERED_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+fn consume_buffered_samples(count: u64) {
+    let _ = BUFFERED_SAMPLES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(count))
+    });
+}
 
 #[no_mangle]
 pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
@@ -49,6 +118,7 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
 
     if url.is_null() {
         PLAYING.store(false, Ordering::SeqCst);
+        set_error("stream URL is null");
         return 0;
     }
 
@@ -57,6 +127,7 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
         Ok(value) => value.to_owned(),
         Err(_) => {
             PLAYING.store(false, Ordering::SeqCst);
+            set_error("stream URL is not valid UTF-8");
             return 0;
         }
     };
@@ -64,10 +135,21 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
     DECODED_PACKETS.store(0, Ordering::SeqCst);
     DECODE_ERRORS.store(0, Ordering::SeqCst);
     QUEUED_BUFFERS.store(0, Ordering::SeqCst);
+    UNDERRUNS.store(0, Ordering::SeqCst);
+    LATENCY_MS.store(0, Ordering::SeqCst);
+    RECONNECTS.store(0, Ordering::SeqCst);
+    BUFFERED_SAMPLES.store(0, Ordering::SeqCst);
+    clear_error();
+    set_state(PlaybackState::Starting);
 
     std::thread::spawn(move || {
-        let _ = RUNTIME.block_on(stream_and_play(url));
+        let result = RUNTIME.block_on(stream_and_play(url));
         PLAYING.store(false, Ordering::SeqCst);
+        if let Err(error) = result {
+            set_error(&error.to_string());
+        } else if state() != PlaybackState::Error {
+            set_state(PlaybackState::Stopped);
+        }
     });
 
     1
@@ -75,6 +157,7 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn cascadia_audio_stop() -> i32 {
+    set_state(PlaybackState::Stopping);
     PLAYING.store(false, Ordering::SeqCst);
     1
 }
@@ -86,6 +169,32 @@ pub extern "C" fn cascadia_audio_is_playing() -> i32 {
     } else {
         0
     }
+}
+
+#[no_mangle]
+pub extern "C" fn cascadia_audio_state() -> i32 {
+    PLAYBACK_STATE.load(Ordering::SeqCst) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn cascadia_audio_last_error(buffer: *mut u8, buffer_len: usize) -> i32 {
+    if buffer.is_null() || buffer_len == 0 {
+        return 0;
+    }
+
+    let copied = if let Ok(lock) = LAST_ERROR.lock() {
+        let bytes = lock.as_bytes();
+        let len = bytes.len().min(buffer_len.saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, len);
+            *buffer.add(len) = 0;
+        }
+        len
+    } else {
+        0
+    };
+
+    copied as i32
 }
 
 #[no_mangle]
@@ -107,10 +216,63 @@ pub extern "C" fn cascadia_audio_debug_counters(
     1
 }
 
+#[no_mangle]
+pub extern "C" fn cascadia_audio_debug_telemetry(
+    underruns: *mut u64,
+    latency_ms: *mut u64,
+    reconnects: *mut u64,
+) -> i32 {
+    if underruns.is_null() || latency_ms.is_null() || reconnects.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        *underruns = UNDERRUNS.load(Ordering::SeqCst);
+        *latency_ms = LATENCY_MS.load(Ordering::SeqCst);
+        *reconnects = RECONNECTS.load(Ordering::SeqCst);
+    }
+
+    1
+}
+
+const MAX_RECONNECT_ATTEMPTS: usize = 3;
+
 async fn stream_and_play(url: String) -> Result<()> {
+    let mut attempts = 0usize;
+    loop {
+        if !PLAYING.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if attempts == 0 {
+            set_state(PlaybackState::Starting);
+        } else {
+            RECONNECTS.fetch_add(1, Ordering::SeqCst);
+            set_state(PlaybackState::Reconnecting);
+            tokio::time::sleep(Duration::from_secs((attempts as u64).min(5))).await;
+        }
+
+        let result = stream_and_play_once(&url).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(_err) if !PLAYING.load(Ordering::SeqCst) => return Ok(()),
+            Err(err) if attempts >= MAX_RECONNECT_ATTEMPTS => {
+                return Err(anyhow!(
+                    "playback failed after {} reconnect attempts: {err}",
+                    attempts
+                ))
+            }
+            Err(_) => {
+                attempts += 1;
+            }
+        }
+    }
+}
+
+async fn stream_and_play_once(url: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let response = client
-        .get(&url)
+        .get(url)
         .header("Icy-MetaData", HeaderValue::from_static("1"))
         .header(
             "User-Agent",
@@ -133,16 +295,23 @@ async fn stream_and_play(url: String) -> Result<()> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
 
-    if content_type
-        .as_deref()
-        .map(|ct| ct.contains("aac"))
-        .unwrap_or(false)
-    {
-        return decode_aac_ffmpeg(&url);
+    let mut stream = response.bytes_stream();
+    let first_chunk = match stream.next().await {
+        Some(Ok(chunk)) => Some(chunk),
+        Some(Err(err)) => return Err(anyhow!("stream read failed: {err}")),
+        None => None,
+    };
+
+    let sniff = first_chunk.as_deref();
+    if is_likely_aac(content_type.as_deref(), url, sniff) {
+        set_state(PlaybackState::Buffering);
+        return decode_aac_ffmpeg(url);
     }
 
     let (tx, rx) = mpsc::sync_channel::<Bytes>(32);
-    let mut stream = response.bytes_stream();
+    if let Some(chunk) = first_chunk {
+        let _ = tx.send(chunk);
+    }
 
     let producer = tokio::spawn(async move {
         while PLAYING.load(Ordering::SeqCst) {
@@ -157,9 +326,45 @@ async fn stream_and_play(url: String) -> Result<()> {
         }
     });
 
+    set_state(PlaybackState::Buffering);
     let playback_result = decode_and_play(rx, content_type, icy_interval);
     let _ = producer.await;
     playback_result
+}
+
+fn is_likely_aac(content_type: Option<&str>, url: &str, sniff: Option<&[u8]>) -> bool {
+    let content_type_aac = content_type
+        .map(|ct| ct.to_ascii_lowercase())
+        .map(|ct| {
+            ct.contains("aac")
+                || ct.contains("aacp")
+                || ct.contains("x-aac")
+                || ct.contains("audio/mp4")
+        })
+        .unwrap_or(false);
+    if content_type_aac {
+        return true;
+    }
+
+    let url_path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if url_path.ends_with(".aac")
+        || url_path.ends_with(".aacp")
+        || url_path.ends_with(".m4a")
+        || url_path.ends_with(".mp4")
+    {
+        return true;
+    }
+
+    if let Some(bytes) = sniff {
+        if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xF0) == 0xF0 {
+            return true;
+        }
+        if bytes.len() >= 4 && &bytes[..4] == b"ADIF" {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn decode_and_play(
@@ -167,6 +372,7 @@ fn decode_and_play(
     content_type: Option<String>,
     icy_interval: Option<usize>,
 ) -> Result<()> {
+    set_state(PlaybackState::Buffering);
     let prebuffer = prebuffer_stream(&rx, 64 * 1024, Duration::from_secs(3));
     let source = ChannelSource::new(rx, icy_interval, prebuffer);
 
@@ -206,6 +412,7 @@ fn decode_and_play(
         .ok_or_else(|| anyhow!("no default output device"))?;
     let config = select_output_config(&device)?;
     let output_channels = usize::from(config.channels);
+    let output_sample_rate = config.sample_rate.0;
 
     let mut current = Vec::<f32>::new();
     let mut current_idx = 0usize;
@@ -218,6 +425,8 @@ fn decode_and_play(
             }
 
             let volume = f32::from_bits(VOLUME_BITS.load(Ordering::Relaxed));
+            let mut consumed = 0u64;
+            let mut had_underrun = false;
 
             for sample in output.iter_mut() {
                 if current_idx >= current.len() {
@@ -227,6 +436,7 @@ fn decode_and_play(
                             current_idx = 0;
                         }
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                            had_underrun = true;
                             *sample = 0.0;
                             continue;
                         }
@@ -235,12 +445,19 @@ fn decode_and_play(
 
                 *sample = current[current_idx] * volume;
                 current_idx += 1;
+                consumed += 1;
             }
+            if had_underrun {
+                UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+            }
+            consume_buffered_samples(consumed);
+            update_latency(output_sample_rate, output_channels);
         },
         move |_err| {},
         None,
     )?;
     stream.play()?;
+    set_state(PlaybackState::Playing);
 
     decode_loop(
         &mut *format,
@@ -254,6 +471,7 @@ fn decode_and_play(
 }
 
 fn decode_aac_ffmpeg(url: &str) -> Result<()> {
+    set_state(PlaybackState::Buffering);
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -336,7 +554,9 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
             }
 
             let mut queue_guard = stdout_queue.lock().expect("audio queue poisoned");
+            BUFFERED_SAMPLES.fetch_add(samples.len() as u64, Ordering::Relaxed);
             queue_guard.push_back(samples);
+            QUEUED_BUFFERS.fetch_add(1, Ordering::Relaxed);
             while queue_guard.len() > 256 {
                 queue_guard.pop_front();
             }
@@ -383,6 +603,8 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
             let mut queue_guard = queue_for_callback.lock().expect("audio queue poisoned");
             let mut pending = queue_guard.pop_front();
             let mut pending_index = 0usize;
+            let mut consumed = 0u64;
+            let mut had_underrun = false;
             for sample in output.iter_mut() {
                 if pending.is_none()
                     || pending_index >= pending.as_ref().map(|frame| frame.len()).unwrap_or(0)
@@ -392,20 +614,29 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
                 }
                 if let Some(frame) = pending.as_ref() {
                     *sample = frame[pending_index] * volume;
+                    consumed += 1;
                 } else {
+                    had_underrun = true;
                     *sample = 0.0;
                 }
                 pending_index += 1;
             }
+            if had_underrun {
+                UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+            }
+            consume_buffered_samples(consumed);
+            update_latency(output_sample_rate, output_channels);
         },
         move |_err| {},
         None,
     )?;
     stream.play()?;
+    set_state(PlaybackState::Playing);
 
+    let mut ffmpeg_exit = None;
     while PLAYING.load(Ordering::SeqCst) {
-        if ffmpeg.try_wait()?.is_some() {
-            PLAYING.store(false, Ordering::SeqCst);
+        if let Some(status) = ffmpeg.try_wait()? {
+            ffmpeg_exit = Some(status);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -416,6 +647,9 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     std::thread::sleep(Duration::from_millis(10));
+    if let Some(status) = ffmpeg_exit {
+        return Err(anyhow!("ffmpeg exited unexpectedly: {status}"));
+    }
     Ok(())
 }
 
@@ -453,6 +687,7 @@ fn decode_loop(
             SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         sample_buffer.copy_interleaved_ref(decoded);
         let remixed = remix_channels(sample_buffer.samples(), input_channels, output_channels);
+        BUFFERED_SAMPLES.fetch_add(remixed.len() as u64, Ordering::Relaxed);
         if ring_tx.send(remixed).is_err() {
             break;
         }
@@ -696,4 +931,45 @@ fn prebuffer_stream(
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_likely_aac;
+
+    #[test]
+    fn detects_aac_from_content_type() {
+        assert!(is_likely_aac(
+            Some("audio/aacp"),
+            "https://example.com/stream",
+            None
+        ));
+    }
+
+    #[test]
+    fn detects_aac_from_url_extension() {
+        assert!(is_likely_aac(
+            None,
+            "https://example.com/live/channel.aac?token=abc",
+            None
+        ));
+    }
+
+    #[test]
+    fn detects_aac_from_adts_sync_word() {
+        assert!(is_likely_aac(
+            None,
+            "https://example.com/live",
+            Some(&[0xFF, 0xF1, 0x50, 0x80])
+        ));
+    }
+
+    #[test]
+    fn does_not_misclassify_mp3_stream() {
+        assert!(!is_likely_aac(
+            Some("audio/mpeg"),
+            "https://example.com/live.mp3",
+            Some(&[0x49, 0x44, 0x33, 0x04])
+        ));
+    }
 }
