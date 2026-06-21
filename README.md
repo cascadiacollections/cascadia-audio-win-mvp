@@ -68,11 +68,17 @@ stream startup still benefits from pre-buffering. If playback stalls on first
 launch, wait a moment for the initial audio buffer to accumulate before judging
 it a failure.
 
+## Playback state and telemetry
+- Native state machine: `Stopped`, `Starting`, `Buffering`, `Playing`,
+  `Reconnecting`, `Stopping`, `Error`
+- Automatic reconnect retries for transient stream failures
+- Native telemetry counters include decode stats plus underrun count, estimated
+  buffered latency, and reconnect attempts
+
 ## Known limitations (deferred to full engine)
 - No pause, only stop
 - No seek
 - No volume control UI (Rust side has AtomicU32 volume, not wired to UI)
-- No error recovery / reconnect
 - No MediaSession / SMTC integration (system transport controls)
 - No background playback
 
