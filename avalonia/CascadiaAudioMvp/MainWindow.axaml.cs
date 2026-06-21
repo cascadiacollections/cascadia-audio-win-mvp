@@ -19,6 +19,7 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(500),
         };
         _stateTimer.Tick += (_, _) => RefreshPlaybackState();
+        Closed += (_, _) => _stateTimer.Stop();
         _stateTimer.Start();
     }
 
@@ -63,6 +64,11 @@ public partial class MainWindow : Window
                 StatusText.Text = "Reconnecting stream...";
                 PlayButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
+                break;
+            case PlaybackState.Stopping:
+                StatusText.Text = "Stopping...";
+                PlayButton.IsEnabled = false;
+                StopButton.IsEnabled = false;
                 break;
             case PlaybackState.Error:
                 var error = _audio.LastError;

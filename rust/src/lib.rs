@@ -113,6 +113,19 @@ fn consume_queued_buffers(count: u64) {
     });
 }
 
+fn stop_requested() -> bool {
+    !PLAYING.load(Ordering::SeqCst) && state() == PlaybackState::Stopping
+}
+
+fn trim_queued_frames(queue: &mut VecDeque<Vec<f32>>, max_len: usize) {
+    while queue.len() > max_len {
+        if let Some(dropped) = queue.pop_front() {
+            consume_queued_buffers(1);
+            consume_buffered_samples(dropped.len() as u64);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
     if PLAYING
@@ -163,8 +176,9 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn cascadia_audio_stop() -> i32 {
-    set_state(PlaybackState::Stopping);
-    PLAYING.store(false, Ordering::SeqCst);
+    if PLAYING.swap(false, Ordering::SeqCst) {
+        set_state(PlaybackState::Stopping);
+    }
     1
 }
 
@@ -247,7 +261,11 @@ async fn stream_and_play(url: String) -> Result<()> {
     let mut attempts = 0usize;
     loop {
         if !PLAYING.load(Ordering::SeqCst) {
-            return Ok(());
+            return if state() == PlaybackState::Stopping {
+                Ok(())
+            } else {
+                Err(anyhow!("playback stopped unexpectedly"))
+            };
         }
 
         if attempts == 0 {
@@ -261,7 +279,7 @@ async fn stream_and_play(url: String) -> Result<()> {
         let result = stream_and_play_once(&url).await;
         match result {
             Ok(()) => return Ok(()),
-            Err(_err) if !PLAYING.load(Ordering::SeqCst) => return Ok(()),
+            Err(_err) if stop_requested() => return Ok(()),
             Err(err) if attempts >= MAX_RECONNECT_ATTEMPTS => {
                 return Err(anyhow!(
                     "playback failed after {} reconnect attempts: {err}",
@@ -564,10 +582,7 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
             BUFFERED_SAMPLES.fetch_add(samples.len() as u64, Ordering::Relaxed);
             queue_guard.push_back(samples);
             QUEUED_BUFFERS.fetch_add(1, Ordering::Relaxed);
-            while queue_guard.len() > 256 {
-                queue_guard.pop_front();
-                consume_queued_buffers(1);
-            }
+            trim_queued_frames(&mut queue_guard, 256);
         }
         Ok(())
     });
@@ -585,7 +600,6 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
 
     while PLAYING.load(Ordering::SeqCst) {
         if let Some(status) = ffmpeg.try_wait()? {
-            PLAYING.store(false, Ordering::SeqCst);
             return Err(anyhow!("ffmpeg exited unexpectedly: {status}"));
         }
 
@@ -993,14 +1007,8 @@ mod tests {
             remix_channels(&[0.5, -0.25], 1, 2),
             vec![0.5, 0.5, -0.25, -0.25]
         );
-        assert_eq!(
-            remix_channels(&[0.8, -0.2, 0.1, 0.3], 2, 1),
-            vec![0.3, 0.2]
-        );
-        assert_eq!(
-            remix_channels(&[1.0, 0.5, 0.25], 3, 2),
-            vec![1.0, 0.5]
-        );
+        assert_eq!(remix_channels(&[0.8, -0.2, 0.1, 0.3], 2, 1), vec![0.3, 0.2]);
+        assert_eq!(remix_channels(&[1.0, 0.5, 0.25], 3, 2), vec![1.0, 0.5]);
         assert!(remix_channels(&[1.0, 2.0], 0, 2).is_empty());
     }
 
@@ -1012,7 +1020,8 @@ mod tests {
             .expect("send metadata length");
         tx.send(Bytes::from(vec![b'x'; 16]))
             .expect("send metadata payload");
-        tx.send(Bytes::from_static(b"EFGH")).expect("send tail audio");
+        tx.send(Bytes::from_static(b"EFGH"))
+            .expect("send tail audio");
         drop(tx);
 
         let mut source = ChannelSource::new(rx, Some(4), VecDeque::new());
@@ -1035,5 +1044,49 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
         assert!(total >= 5);
+    }
+
+    #[test]
+    fn trim_queued_frames_updates_buffer_telemetry() {
+        let queued_before = QUEUED_BUFFERS.swap(2, Ordering::SeqCst);
+        let buffered_before = BUFFERED_SAMPLES.swap(10, Ordering::SeqCst);
+
+        let mut queue = VecDeque::from([vec![1.0_f32; 4], vec![1.0_f32; 6]]);
+        trim_queued_frames(&mut queue, 1);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(QUEUED_BUFFERS.load(Ordering::SeqCst), 1);
+        assert_eq!(BUFFERED_SAMPLES.load(Ordering::SeqCst), 6);
+
+        QUEUED_BUFFERS.store(queued_before, Ordering::SeqCst);
+        BUFFERED_SAMPLES.store(buffered_before, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn stop_requested_depends_on_stopping_state() {
+        let was_playing = PLAYING.swap(false, Ordering::SeqCst);
+        let state_before = state();
+
+        set_state(PlaybackState::Stopping);
+        assert!(stop_requested());
+
+        set_state(PlaybackState::Error);
+        assert!(!stop_requested());
+
+        PLAYING.store(was_playing, Ordering::SeqCst);
+        set_state(state_before);
+    }
+
+    #[test]
+    fn stop_does_not_overwrite_non_playing_state() {
+        let was_playing = PLAYING.swap(false, Ordering::SeqCst);
+        let state_before = state();
+
+        set_state(PlaybackState::Error);
+        assert_eq!(cascadia_audio_stop(), 1);
+        assert!(matches!(state(), PlaybackState::Error));
+
+        PLAYING.store(was_playing, Ordering::SeqCst);
+        set_state(state_before);
     }
 }
