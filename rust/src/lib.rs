@@ -128,15 +128,9 @@ fn trim_queued_frames(queue: &mut VecDeque<Vec<f32>>, max_len: usize) {
 
 #[no_mangle]
 pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
-    if PLAYING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return 0;
-    }
-
+    // Validate before claiming PLAYING, so a rejected call is never
+    // observable as playing by a concurrent cascadia_audio_is_playing().
     if url.is_null() {
-        PLAYING.store(false, Ordering::SeqCst);
         set_error("stream URL is null");
         return 0;
     }
@@ -145,11 +139,17 @@ pub extern "C" fn cascadia_audio_start(url: *const c_char) -> i32 {
     let url = match url.to_str() {
         Ok(value) => value.to_owned(),
         Err(_) => {
-            PLAYING.store(false, Ordering::SeqCst);
             set_error("stream URL is not valid UTF-8");
             return 0;
         }
     };
+
+    if PLAYING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return 0;
+    }
 
     DECODED_PACKETS.store(0, Ordering::SeqCst);
     DECODE_ERRORS.store(0, Ordering::SeqCst);
