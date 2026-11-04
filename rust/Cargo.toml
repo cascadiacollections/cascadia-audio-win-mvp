@@ -9,10 +9,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = "1"
 bytes = "1"
-cpal = "0.15"
+cpal = "0.18"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
-symphonia = { version = "0.5", features = ["mp3", "aac", "ogg"] }
+symphonia = { version = "0.6", features = ["mp3", "aac", "ogg"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [profile.release]

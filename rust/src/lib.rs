@@ -16,13 +16,13 @@ use cpal::{
 };
 use futures::StreamExt;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
 static PLAYING: AtomicBool = AtomicBool::new(false);
@@ -413,21 +413,23 @@ fn decode_and_play(
         }
     }
 
-    let probed = get_probe().format(
+    let mut format = get_probe().probe(
         &hint,
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
-    let mut format = probed.format;
 
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| anyhow!("no default audio track found"))?;
     let track_id = track.id;
-    let codec_params = &track.codec_params;
+    let Some(CodecParameters::Audio(codec_params)) = &track.codec_params else {
+        return Err(anyhow!("default track has no audio codec parameters"));
+    };
 
-    let mut decoder = get_codecs().make(codec_params, &DecoderOptions::default())?;
+    let mut decoder =
+        get_codecs().make_audio_decoder(codec_params, &AudioDecoderOptions::default())?;
     let (ring_tx, ring_rx) = mpsc::sync_channel::<Vec<f32>>(64);
 
     let host = cpal::default_host();
@@ -436,12 +438,12 @@ fn decode_and_play(
         .ok_or_else(|| anyhow!("no default output device"))?;
     let config = select_output_config(&device)?;
     let output_channels = usize::from(config.channels);
-    let output_sample_rate = config.sample_rate.0;
+    let output_sample_rate = config.sample_rate;
 
     let mut current = Vec::<f32>::new();
     let mut current_idx = 0usize;
     let stream = device.build_output_stream(
-        &config,
+        config,
         move |output: &mut [f32], _| {
             if !PLAYING.load(Ordering::SeqCst) {
                 output.fill(0.0);
@@ -503,7 +505,7 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("no default output device"))?;
     let config = select_output_config(&device)?;
     let output_channels = usize::from(config.channels);
-    let output_sample_rate = config.sample_rate.0;
+    let output_sample_rate = config.sample_rate;
 
     let queue: Arc<Mutex<VecDeque<Vec<f32>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let queue_for_callback = Arc::clone(&queue);
@@ -614,7 +616,7 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
     }
 
     let stream = device.build_output_stream(
-        &config,
+        config,
         move |output: &mut [f32], _| {
             if !PLAYING.load(Ordering::SeqCst) {
                 output.fill(0.0);
@@ -682,20 +684,20 @@ fn decode_aac_ffmpeg(url: &str) -> Result<()> {
 }
 
 fn decode_loop(
-    format: &mut dyn symphonia::core::formats::FormatReader,
-    decoder: &mut dyn symphonia::core::codecs::Decoder,
+    format: &mut dyn FormatReader,
+    decoder: &mut dyn AudioDecoder,
     ring_tx: SyncSender<Vec<f32>>,
     track_id: u32,
     output_channels: usize,
 ) -> Result<()> {
     while PLAYING.load(Ordering::SeqCst) {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(_)) => break,
+            Ok(Some(packet)) => packet,
+            Ok(None) | Err(SymphoniaError::IoError(_)) => break,
             Err(error) => return Err(anyhow!("format read error: {error}")),
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -710,11 +712,10 @@ fn decode_loop(
         };
         DECODED_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-        let input_channels = decoded.spec().channels.count();
-        let mut sample_buffer =
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buffer.copy_interleaved_ref(decoded);
-        let remixed = remix_channels(sample_buffer.samples(), input_channels, output_channels);
+        let input_channels = decoded.spec().channels().count();
+        let mut samples = Vec::<f32>::with_capacity(decoded.samples_interleaved());
+        decoded.copy_to_vec_interleaved(&mut samples);
+        let remixed = remix_channels(&samples, input_channels, output_channels);
         BUFFERED_SAMPLES.fetch_add(remixed.len() as u64, Ordering::Relaxed);
         if ring_tx.send(remixed).is_err() {
             break;
