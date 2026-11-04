@@ -9,6 +9,8 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "deps"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "nuget"
     directories:
@@ -22,6 +24,8 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "deps"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -32,3 +36,5 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "ci"
+    cooldown:
+      default-days: 7
