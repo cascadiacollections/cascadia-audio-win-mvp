@@ -14,7 +14,7 @@ via P/Invoke. No Media Foundation. No NAudio. No Windows.Media.Playback.
 
 ## Prerequisites
 - Rust stable
-- .NET 9 SDK
+- .NET 10 SDK
 - FFmpeg CLI installed and on `PATH` (required for AAC/HE-AAC decoding)
 - Linux audio build deps (Fedora): `sudo dnf install pkgconf-pkg-config alsa-lib-devel ffmpeg`
 - Linux audio build deps (Ubuntu): `sudo apt-get install -y pkg-config libasound2-dev ffmpeg`
